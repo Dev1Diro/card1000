@@ -11,7 +11,7 @@ const DEFAULT_PATH = path.join(__dirname, 'storage.json');
 const DATA_FILE = process.env.DATA_FILE ? path.resolve(process.env.DATA_FILE) : DEFAULT_PATH;
 const BACKUP_DIR = `${DATA_FILE}.backups`;
 const MAX_BACKUPS = 10;
-const FLUSH_INTERVAL_MS = 60 * 1000; // 1분
+const FLUSH_INTERVAL_MS = 60 * 1000;
 const SAVE_RETRY_DELAY_MS = 200;
 const SAVE_RETRY_COUNT = 2;
 
@@ -26,23 +26,16 @@ function createEmptyData() {
   return { cards: {}, money: {}, payments: {} };
 }
 
-function normalizeDataShape(data) {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    return { normalized: createEmptyData(), changed: true };
-  }
+function ensureObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
 
-  const normalized = {
-    cards: data.cards && typeof data.cards === 'object' && !Array.isArray(data.cards) ? data.cards : {},
-    money: data.money && typeof data.money === 'object' && !Array.isArray(data.money) ? data.money : {},
-    payments: data.payments && typeof data.payments === 'object' && !Array.isArray(data.payments) ? data.payments : {}
-  };
-
-  const changed =
-    normalized.cards !== data.cards ||
-    normalized.money !== data.money ||
-    normalized.payments !== data.payments;
-
-  return { normalized, changed };
+function ensureDataShape(data) {
+  const base = ensureObject(data);
+  base.cards = ensureObject(base.cards);
+  base.money = ensureObject(base.money);
+  base.payments = ensureObject(base.payments);
+  return base;
 }
 
 function formatNow() {
@@ -99,6 +92,7 @@ async function backupCorruptFile(filePath) {
 
 async function init() {
   if (initialized) return;
+
   try {
     await fs.ensureDir(path.dirname(DATA_FILE));
     await fs.ensureFile(DATA_FILE);
@@ -118,15 +112,9 @@ async function init() {
       const raw = await fs.readFile(DATA_FILE, 'utf8');
       try {
         const parsed = JSON.parse(raw);
-        const { normalized, changed } = normalizeDataShape(parsed);
-        inMemory = normalized;
+        inMemory = ensureDataShape(parsed);
+        await safeWriteWithRetry(DATA_FILE, inMemory);
         dirty = false;
-
-        if (changed) {
-          await safeWriteWithRetry(DATA_FILE, inMemory);
-          console.log('Storage schema normalized and persisted.');
-        }
-
         console.log('Loaded storage from', DATA_FILE);
       } catch (parseErr) {
         console.error('parse error, backing up and reinitializing:', parseErr);
@@ -174,6 +162,7 @@ async function init() {
 
 function get() {
   if (!initialized) throw new Error('storage not initialized');
+  inMemory = ensureDataShape(inMemory);
   return inMemory;
 }
 
@@ -225,16 +214,12 @@ async function flushAll() {
 
 async function setData(mutator) {
   if (!initialized) throw new Error('storage not initialized');
-  try {
-    const normalized = normalizeDataShape(inMemory).normalized;
-    inMemory = normalized;
-    mutator(inMemory);
-    markDirty();
-    await enqueueSave(inMemory);
-    dirty = false;
-  } catch (e) {
-    throw e;
-  }
+  inMemory = ensureDataShape(inMemory);
+  mutator(inMemory);
+  inMemory = ensureDataShape(inMemory);
+  markDirty();
+  await enqueueSave(inMemory);
+  dirty = false;
 }
 
 module.exports = {
@@ -244,4 +229,4 @@ module.exports = {
   enqueueSave,
   flushAll,
   DATA_FILE
-};s
+};

@@ -55,6 +55,13 @@ function parseAmount(raw) {
   return n;
 }
 
+async function safeReply(interaction, payload) {
+  if (interaction.deferred || interaction.replied) {
+    return interaction.followUp(payload);
+  }
+  return interaction.reply(payload);
+}
+
 function kstDateString(date = new Date()) {
   const parts = new Intl.DateTimeFormat('ko-KR', {
     timeZone: 'Asia/Seoul',
@@ -131,7 +138,7 @@ async function registerGlobalCommands() {
         const norm = normalizeCard(raw);
 
         if (!/^\d{16}$/.test(norm)) {
-          return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
+          return safeReply(interaction, { content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
         }
 
         try {
@@ -146,11 +153,12 @@ async function registerGlobalCommands() {
           });
         } catch (saveErr) {
           console.error('데이터 저장 실패:', saveErr);
-          return interaction.reply({ content: '서버 내부 오류: 카드 등록 중 저장에 실패했습니다.', ephemeral: true });
+          return safeReply(interaction, { content: '서버 내부 오류: 카드 등록 중 저장에 실패했습니다.', ephemeral: true });
         }
 
-        const balance = storage.get().money?.[norm] || 0;
-        return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}** (잔액: ${balance.toLocaleString()}원)` });
+        const latest = storage.get();
+        const balance = Number(latest.money?.[norm] || 0);
+        return safeReply(interaction, { content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}** (잔액: ${balance.toLocaleString()}원)` });
       }
 
       if (interaction.commandName === '카드충전') {
@@ -159,11 +167,11 @@ async function registerGlobalCommands() {
         const data = storage.get();
 
         if (!data.cards?.[norm]) {
-          return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
+          return safeReply(interaction, { content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
         }
 
         if (!amountNum) {
-          return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
+          return safeReply(interaction, { content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         }
 
         try {
@@ -173,11 +181,11 @@ async function registerGlobalCommands() {
           });
         } catch (saveErr) {
           console.error('충전 저장 실패:', saveErr);
-          return interaction.reply({ content: '서버 내부 오류: 충전 중 저장에 실패했습니다.', ephemeral: true });
+          return safeReply(interaction, { content: '서버 내부 오류: 충전 중 저장에 실패했습니다.', ephemeral: true });
         }
 
         const newBal = storage.get().money?.[norm] || 0;
-        return interaction.reply({ content: `충전 완료: **${formatCardDisplay(norm)}**에 ${amountNum.toLocaleString()}원 충전되었습니다. 잔액: ${newBal.toLocaleString()}원` });
+        return safeReply(interaction, { content: `충전 완료: **${formatCardDisplay(norm)}**에 ${amountNum.toLocaleString()}원 충전되었습니다. 잔액: ${newBal.toLocaleString()}원` });
       }
 
       if (interaction.commandName === '결제') {
@@ -186,16 +194,16 @@ async function registerGlobalCommands() {
         const data = storage.get();
 
         if (!data.cards?.[norm]) {
-          return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
+          return safeReply(interaction, { content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
         }
 
         if (!amountNum) {
-          return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
+          return safeReply(interaction, { content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         }
 
         const currentBalance = data.money?.[norm] || 0;
         if (currentBalance < amountNum) {
-          return interaction.reply({ content: `잔액이 부족합니다. 현재 잔액: ${currentBalance.toLocaleString()}원`, ephemeral: true });
+          return safeReply(interaction, { content: `잔액이 부족합니다. 현재 잔액: ${currentBalance.toLocaleString()}원`, ephemeral: true });
         }
 
         const now = new Date();
@@ -209,7 +217,7 @@ async function registerGlobalCommands() {
           });
         } catch (saveErr) {
           console.error('결제 저장 실패:', saveErr);
-          return interaction.reply({ content: '서버 내부 오류: 결제 기록 저장 실패', ephemeral: true });
+          return safeReply(interaction, { content: '서버 내부 오류: 결제 기록 저장 실패', ephemeral: true });
         }
 
         const embed = new EmbedBuilder()
@@ -223,7 +231,7 @@ async function registerGlobalCommands() {
           .setColor(0x00AE86)
           .setTimestamp(now);
 
-        return interaction.reply({ embeds: [embed] });
+        return safeReply(interaction, { embeds: [embed] });
       }
 
       if (interaction.commandName === '결제내역') {
@@ -231,12 +239,12 @@ async function registerGlobalCommands() {
         const data = storage.get();
 
         if (!data.cards?.[norm]) {
-          return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
+          return safeReply(interaction, { content: '등록되지 않은 카드입니다.', ephemeral: true });
         }
 
         const payments = data.payments?.[norm] || [];
         if (payments.length === 0) {
-          return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
+          return safeReply(interaction, { content: '결제 내역이 없습니다.', ephemeral: true });
         }
 
         const pageSize = 10;
@@ -266,7 +274,7 @@ async function registerGlobalCommands() {
         const row = new ActionRowBuilder().addComponents(prevBtn, nextBtn);
 
         let current = 0;
-        const message = await interaction.reply({ embeds: [makeEmbedForPage(current)], components: [row], fetchReply: true });
+        const message = await safeReply(interaction, { embeds: [makeEmbedForPage(current)], components: [row], fetchReply: true });
 
         const collector = message.createMessageComponentCollector({
           componentType: ComponentType.Button,
@@ -300,9 +308,9 @@ async function registerGlobalCommands() {
         });
       }
     } catch (err) {
-      console.error('명령 처리 중 오류:', err);
+      console.error(`명령 처리 중 오류 [${interaction.commandName}]:`, err);
       try {
-        await interaction.reply({ content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
+        await safeReply(interaction, { content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
       } catch (e) {
         /* ignore */
       }
