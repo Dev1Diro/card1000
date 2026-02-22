@@ -1,7 +1,6 @@
 /**
  * index.js
- * - 메인 애플리케이션: Discord 명령 처리
- * - storage.js를 사용하여 데이터 안전성 보장
+ * - Discord Card Bot (cards / money / payments 통합형)
  */
 
 const http = require('http');
@@ -16,7 +15,6 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const REGISTER_COMMANDS = (process.env.REGISTER_COMMANDS || 'false').toLowerCase() === 'true';
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
-// 환경변수 검사
 if (!TOKEN || TOKEN.trim().length === 0) {
   console.error('FATAL: TOKEN 환경변수가 설정되어 있지 않습니다.');
   process.exit(1);
@@ -26,7 +24,6 @@ if (!CLIENT_ID || CLIENT_ID.trim().length === 0) {
   process.exit(1);
 }
 
-// HTTP 바인딩 (Render)
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
@@ -34,7 +31,6 @@ http.createServer((req, res) => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
 
-// 유틸
 function normalizeCard(card) { return String(card).replace(/-/g, '').trim(); }
 function formatCardDisplay(card) {
   const n = normalizeCard(card);
@@ -51,12 +47,16 @@ function kstDateString(date = new Date()) {
   return `${y}/${m}/${d}`;
 }
 
-// 슬래시 명령 정의
 const commands = [
   new SlashCommandBuilder()
     .setName('카드등록')
     .setDescription('카드를 등록합니다 (16자리, 하이픈 허용)')
     .addStringOption(opt => opt.setName('번호').setDescription('예: 1234-5678-9012-3456').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('카드충전')
+    .setDescription('카드에 잔액을 충전합니다')
+    .addStringOption(opt => opt.setName('카드번호').setDescription('등록된 카드번호').setRequired(true))
+    .addStringOption(opt => opt.setName('금액').setDescription('예: 5000 또는 5,000').setRequired(true)),
   new SlashCommandBuilder()
     .setName('결제')
     .setDescription('카드로 결제합니다')
@@ -84,7 +84,6 @@ async function registerGlobalCommands() {
 }
 
 (async () => {
-  // storage 초기화
   try {
     await storage.init();
     console.log('storage initialized at', storage.DATA_FILE);
@@ -105,6 +104,7 @@ async function registerGlobalCommands() {
     if (!interaction.isChatInputCommand()) return;
 
     try {
+      // 카드등록: money 초기화(0)
       if (interaction.commandName === '카드등록') {
         const raw = interaction.options.getString('번호');
         const norm = normalizeCard(raw);
@@ -112,10 +112,10 @@ async function registerGlobalCommands() {
           return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
         }
 
-        // 안전한 변경: setData를 통해 동기적 변경 + 저장 보장
         try {
           await storage.setData(data => {
             data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
+            data.money[norm] = data.money[norm] || 0;
             if (!data.payments[norm]) data.payments[norm] = [];
           });
         } catch (saveErr) {
@@ -123,9 +123,37 @@ async function registerGlobalCommands() {
           return interaction.reply({ content: '서버 내부 오류: 카드 등록 중 저장에 실패했습니다.', ephemeral: true });
         }
 
-        return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}**` });
+        return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}** (잔액: ${storage.get().money[norm].toLocaleString()}원)` });
       }
 
+      // 카드충전: money 증가
+      if (interaction.commandName === '카드충전') {
+        const rawCard = interaction.options.getString('카드번호');
+        const amountRaw = interaction.options.getString('금액');
+        const norm = normalizeCard(rawCard);
+        const data = storage.get();
+        if (!data.cards[norm]) {
+          return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
+        }
+        const amountNum = parseInt(String(amountRaw).replace(/,/g, '').trim(), 10);
+        if (Number.isNaN(amountNum) || amountNum <= 0) {
+          return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
+        }
+
+        try {
+          await storage.setData(d => {
+            d.money[norm] = (d.money[norm] || 0) + amountNum;
+          });
+        } catch (saveErr) {
+          console.error('충전 저장 실패:', saveErr);
+          return interaction.reply({ content: '서버 내부 오류: 충전 중 저장에 실패했습니다.', ephemeral: true });
+        }
+
+        const newBal = storage.get().money[norm];
+        return interaction.reply({ content: `충전 완료: **${formatCardDisplay(norm)}**에 ${amountNum.toLocaleString()}원 충전되었습니다. 잔액: ${newBal.toLocaleString()}원` });
+      }
+
+      // 결제: money 검사 후 차감, payments 기록
       if (interaction.commandName === '결제') {
         const rawCard = interaction.options.getString('카드번호');
         const amountRaw = interaction.options.getString('금액');
@@ -138,9 +166,16 @@ async function registerGlobalCommands() {
         if (Number.isNaN(amountNum) || amountNum <= 0) {
           return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         }
+
+        const currentBalance = data.money[norm] || 0;
+        if (currentBalance < amountNum) {
+          return interaction.reply({ content: `잔액이 부족합니다. 현재 잔액: ${currentBalance.toLocaleString()}원`, ephemeral: true });
+        }
+
         const now = new Date();
         try {
           await storage.setData(d => {
+            d.money[norm] = (d.money[norm] || 0) - amountNum;
             d.payments[norm] = d.payments[norm] || [];
             d.payments[norm].unshift({ amount: amountNum, timestamp: now.toISOString() });
           });
@@ -154,6 +189,7 @@ async function registerGlobalCommands() {
           .addFields(
             { name: '카드', value: formatCardDisplay(norm), inline: true },
             { name: '금액', value: `${amountNum.toLocaleString()}원`, inline: true },
+            { name: '잔액(결제 후)', value: `${storage.get().money[norm].toLocaleString()}원`, inline: true },
             { name: '날짜 (KST)', value: kstDateString(now), inline: true }
           )
           .setColor(0x00AE86)
@@ -162,6 +198,7 @@ async function registerGlobalCommands() {
         return interaction.reply({ embeds: [embed] });
       }
 
+      // 결제내역: payments 사용
       if (interaction.commandName === '결제내역') {
         const rawCard = interaction.options.getString('카드번호');
         const norm = normalizeCard(rawCard);
@@ -235,7 +272,6 @@ async function registerGlobalCommands() {
     }
   });
 
-  // 로그인
   try {
     await client.login(TOKEN);
   } catch (err) {
@@ -243,7 +279,6 @@ async function registerGlobalCommands() {
     process.exit(1);
   }
 
-  // 프로세스 종료 시 storage flush 보장
   process.on('SIGINT', async () => {
     console.log('SIGINT 수신, 종료 중...');
     try { await storage.flushAll(); } catch (e) { /* ignore */ }

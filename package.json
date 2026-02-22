@@ -1,6 +1,6 @@
 {
   "name": "discord-card-bot",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Game card payment bot (virtual) - Render ready, stable",
   "main": "index.js",
   "engines": {

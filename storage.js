@@ -1,10 +1,7 @@
 /**
  * storage.js
  * - 책임: 데이터 로드/저장/백업/주기적 flush/종료 시 대기
- * - 사용법: const storage = require('./storage'); await storage.init(); const data = await storage.load();
- *
- * 환경변수:
- *   DATA_FILE - 저장 파일 경로 (권장 절대경로). 기본: ./storage.json
+ * - 환경변수: DATA_FILE (권장 절대경로). 기본: ./storage.json
  */
 
 const fs = require('fs-extra');
@@ -79,7 +76,6 @@ async function backupCorruptFile(filePath) {
 
 async function init() {
   if (initialized) return;
-  // 강제 파일/디렉터리 생성 및 권한 시도
   try {
     await fs.ensureDir(path.dirname(DATA_FILE));
     await fs.ensureFile(DATA_FILE);
@@ -88,7 +84,6 @@ async function init() {
     console.error('ensure file/dir failed:', e);
   }
 
-  // load or initialize
   try {
     const stats = await fs.stat(DATA_FILE);
     if (stats.size === 0) {
@@ -125,14 +120,12 @@ async function init() {
     }
   }
 
-  // 주기적 flush 타이머
   flushTimer = setInterval(() => {
     if (dirty) {
       enqueueSave(inMemory).catch(e => console.error('periodic flush failed:', e));
     }
   }, FLUSH_INTERVAL_MS);
 
-  // 프로세스 종료 시 대기
   const graceful = async () => {
     console.log('storage: graceful shutdown start, flushing...');
     clearInterval(flushTimer);
@@ -161,7 +154,6 @@ function markDirty() {
 
 function enqueueSave(dataSnapshot) {
   return new Promise((resolve, reject) => {
-    // shallow copy to avoid mutation issues
     const payload = { data: JSON.parse(JSON.stringify(dataSnapshot)), resolve, reject };
     saveQueue.push(payload);
     processQueue().catch(err => console.error('processQueue error:', err));
@@ -195,7 +187,6 @@ async function flushAll() {
   if (!initialized) return;
   if (dirty) {
     await enqueueSave(inMemory);
-    // wait until queue drained
     while (saving || saveQueue.length > 0) {
       await new Promise(r => setTimeout(r, 50));
     }
@@ -204,12 +195,10 @@ async function flushAll() {
 }
 
 async function setData(mutator) {
-  // mutator: function(data) { ... } - synchronous
   if (!initialized) throw new Error('storage not initialized');
   try {
     mutator(inMemory);
     markDirty();
-    // immediate enqueue for critical ops (e.g., card register)
     await enqueueSave(inMemory);
     dirty = false;
   } catch (e) {
