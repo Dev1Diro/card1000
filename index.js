@@ -10,16 +10,17 @@
  *   DATA_FILE         - 저장 파일 경로 (절대경로 권장). 기본: ./storage.json
  *   PORT              - HTTP 포트 (Render Web Service용). 기본: 3000
  *
- * 특징:
- * - 포트 바인딩(간단한 HTTP 200)으로 Render Web Service 요구사항 충족
- * - atomic write + in-memory save queue로 파일 손상/동시성 최소화
- * - 손상된 JSON 자동 백업 및 재생성
- * - 명확한 로그와 안전한 종료 처리
+ * 변경 요약:
+ * - 디렉터리 보장 및 절대경로 사용
+ * - 빈 파일 처리 및 파싱 실패 시 안전 복구
+ * - atomic write (tmp 파일) + 재시도 로직
+ * - save queue 오버플로우 방지
  */
 
 const http = require('http');
 const path = require('path');
 const fs = require('fs-extra');
+const { dirname } = require('path');
 const {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType
@@ -50,20 +51,29 @@ http.createServer((req, res) => {
 });
 
 // --- 안전한 데이터 저장 로직 ---
-// in-memory queue로 save 요청 직렬화 (동시성 완화)
 const saveQueue = [];
 let saving = false;
 
+// atomic write: tmp 파일에 쓰고 이동
 async function atomicWriteJson(filePath, data) {
-  const tmp = `${filePath}.tmp.${Date.now()}`;
-  await fs.writeJson(tmp, data, { spaces: 2 });
-  await fs.move(tmp, filePath, { overwrite: true });
+  const resolved = path.resolve(filePath);
+  await fs.ensureDir(path.dirname(resolved));
+  const tmp = `${resolved}.tmp.${Date.now()}`;
+  await fs.writeJson(tmp, data, { spaces: 2, encoding: 'utf8' });
+  await fs.move(tmp, resolved, { overwrite: true });
 }
 
+// enqueueSave: 큐 길이 제한 및 안정적 처리
 async function enqueueSave(data) {
   return new Promise((resolve, reject) => {
+    if (saveQueue.length > 1000) {
+      return reject(new Error('save queue overflow'));
+    }
     saveQueue.push({ data, resolve, reject });
-    processSaveQueue().catch(err => console.error('save queue error:', err));
+    // processSaveQueue 내부에서 동시 실행을 막음
+    processSaveQueue().catch(err => {
+      console.error('processSaveQueue error:', err);
+    });
   });
 }
 
@@ -76,43 +86,69 @@ async function processSaveQueue() {
       await atomicWriteJson(DATA_FILE, data);
       resolve();
     } catch (err) {
-      reject(err);
+      console.error('atomicWriteJson 실패:', err);
+      // 간단한 재시도(지연 후 1회)
+      try {
+        await new Promise(r => setTimeout(r, 200));
+        await atomicWriteJson(DATA_FILE, data);
+        resolve();
+      } catch (err2) {
+        console.error('재시도 실패:', err2);
+        reject(err2);
+      }
     }
   }
   saving = false;
 }
 
-// loadData: 파일 없으면 생성, 손상 시 백업 후 재생성
+// loadData: 파일 없으면 생성, 빈 파일/파싱 실패 시 복구
 async function loadData() {
   try {
-    if (!await fs.pathExists(DATA_FILE)) {
-      await fs.ensureFile(DATA_FILE);
+    const resolved = path.resolve(DATA_FILE);
+    await fs.ensureDir(path.dirname(resolved));
+
+    if (!await fs.pathExists(resolved)) {
       const init = { cards: {}, payments: {} };
-      await atomicWriteJson(DATA_FILE, init);
-      console.log(`데이터 파일 생성: ${DATA_FILE}`);
+      await atomicWriteJson(resolved, init);
+      console.log(`데이터 파일 생성: ${resolved}`);
       return init;
     }
-    const raw = await fs.readFile(DATA_FILE, 'utf8');
+
+    const stats = await fs.stat(resolved);
+    if (stats.size === 0) {
+      console.warn('데이터 파일이 비어있습니다. 초기화합니다.');
+      const init = { cards: {}, payments: {} };
+      await atomicWriteJson(resolved, init);
+      return init;
+    }
+
+    const raw = await fs.readFile(resolved, 'utf8');
     try {
       const parsed = JSON.parse(raw);
-      // 기본 구조 보장
       parsed.cards = parsed.cards || {};
       parsed.payments = parsed.payments || {};
       return parsed;
     } catch (parseErr) {
       console.error('데이터 파일 파싱 실패:', parseErr);
-      // 백업 후 재생성
-      const bak = `${DATA_FILE}.corrupt.${Date.now()}`;
-      await fs.copy(DATA_FILE, bak);
+      const bak = `${resolved}.corrupt.${Date.now()}`;
+      await fs.copy(resolved, bak);
       console.warn(`손상된 데이터 파일을 백업했습니다: ${bak}`);
       const init = { cards: {}, payments: {} };
-      await atomicWriteJson(DATA_FILE, init);
+      await atomicWriteJson(resolved, init);
       console.log('데이터 파일을 초기화했습니다.');
       return init;
     }
   } catch (err) {
-    console.error('데이터 파일 로드 실패:', err);
-    throw err;
+    console.error('데이터 파일 로드 중 예외:', err);
+    try {
+      const init = { cards: {}, payments: {} };
+      await atomicWriteJson(path.resolve(DATA_FILE), init);
+      console.log('데이터 파일을 강제 초기화했습니다.');
+      return init;
+    } catch (err2) {
+      console.error('강제 초기화 실패:', err2);
+      throw err2;
+    }
   }
 }
 
@@ -163,7 +199,6 @@ async function registerGlobalCommands() {
     console.log('글로벌 명령 등록 요청 전송 완료.');
   } catch (err) {
     console.error('명령 등록 실패:', err);
-    // 치명적이지 않음: 계속 실행
   }
 }
 
@@ -196,7 +231,12 @@ async function registerGlobalCommands() {
         }
         data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
         if (!data.payments[norm]) data.payments[norm] = [];
-        await enqueueSave(data);
+        try {
+          await enqueueSave(data);
+        } catch (saveErr) {
+          console.error('데이터 저장 실패:', saveErr);
+          return interaction.reply({ content: '서버 내부 오류: 카드 등록 중 저장에 실패했습니다.', ephemeral: true });
+        }
         return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}**` });
       }
 
@@ -215,7 +255,12 @@ async function registerGlobalCommands() {
         const entry = { amount: amountNum, timestamp: now.toISOString() };
         data.payments[norm] = data.payments[norm] || [];
         data.payments[norm].unshift(entry); // 최신순
-        await enqueueSave(data);
+        try {
+          await enqueueSave(data);
+        } catch (saveErr) {
+          console.error('데이터 저장 실패:', saveErr);
+          return interaction.reply({ content: '서버 내부 오류: 결제 기록 저장 실패', ephemeral: true });
+        }
 
         const embed = new EmbedBuilder()
           .setTitle('결제 완료')
