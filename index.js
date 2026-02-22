@@ -1,9 +1,9 @@
 /**
- * Discord Card Bot (Global commands)
+ * 안정화된 Discord Card Bot (글로벌 명령 선택 등록)
  * Node 18+, discord.js v14
  *
- * 설정: TOKEN, CLIENT_ID 환경변수로 설정하세요.
- * 배포: 글로벌 명령은 등록 후 전파에 시간이 걸립니다 (최대 1시간 이상).
+ * 필수 환경변수: TOKEN, CLIENT_ID
+ * 선택 환경변수: REGISTER_COMMANDS=true, DATA_FILE=/path/to/storage.json
  */
 
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
@@ -11,19 +11,42 @@ const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
 const fs = require('fs-extra');
 const path = require('path');
 
-const TOKEN = process.env.TOKEN || 'YOUR_BOT_TOKEN';
-const CLIENT_ID = process.env.CLIENT_ID || 'YOUR_CLIENT_ID';
+const TOKEN = process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID;
+const REGISTER_COMMANDS = (process.env.REGISTER_COMMANDS || 'false').toLowerCase() === 'true';
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'storage.json');
 
-const DATA_FILE = path.join(__dirname, 'storage.json');
+// 환경변수 기본 검사
+if (!TOKEN || TOKEN.trim().length === 0) {
+  console.error('FATAL: TOKEN 환경변수가 설정되어 있지 않습니다.');
+  process.exit(1);
+}
+if (!CLIENT_ID || CLIENT_ID.trim().length === 0) {
+  console.error('FATAL: CLIENT_ID 환경변수가 설정되어 있지 않습니다.');
+  process.exit(1);
+}
 
+// 데이터 파일 초기화/로딩
 async function loadData() {
-  if (!await fs.pathExists(DATA_FILE)) {
-    await fs.writeJson(DATA_FILE, { cards: {}, payments: {} }, { spaces: 2 });
+  try {
+    if (!await fs.pathExists(DATA_FILE)) {
+      await fs.ensureFile(DATA_FILE);
+      await fs.writeJson(DATA_FILE, { cards: {}, payments: {} }, { spaces: 2 });
+      console.log(`데이터 파일 생성: ${DATA_FILE}`);
+    }
+    return await fs.readJson(DATA_FILE);
+  } catch (err) {
+    console.error('데이터 파일 로드 실패:', err);
+    throw err;
   }
-  return fs.readJson(DATA_FILE);
 }
 async function saveData(data) {
-  await fs.writeJson(DATA_FILE, data, { spaces: 2 });
+  try {
+    await fs.writeJson(DATA_FILE, data, { spaces: 2 });
+  } catch (err) {
+    console.error('데이터 저장 실패:', err);
+    throw err;
+  }
 }
 
 function normalizeCard(card) {
@@ -44,6 +67,7 @@ function kstDateString(date = new Date()) {
   return `${y}/${m}/${d}`;
 }
 
+// 슬래시 명령 정의
 const commands = [
   new SlashCommandBuilder()
     .setName('카드등록')
@@ -60,16 +84,25 @@ const commands = [
     .addStringOption(opt => opt.setName('카드번호').setDescription('등록된 카드번호').setRequired(true))
 ].map(c => c.toJSON());
 
-(async () => {
-  // 글로벌 명령 등록
+// 글로벌 명령 등록 (선택)
+async function registerGlobalCommands() {
+  if (!REGISTER_COMMANDS) {
+    console.log('글로벌 명령 등록이 비활성화되어 있습니다. (REGISTER_COMMANDS != true)');
+    return;
+  }
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   try {
-    console.log('글로벌 명령 등록 중...');
+    console.log('글로벌 명령 등록 시작...');
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
     console.log('글로벌 명령 등록 요청 전송 완료.');
   } catch (err) {
     console.error('명령 등록 실패:', err);
+    // 명령 등록 실패는 치명적이지 않으므로 프로세스 종료하지 않음
   }
+}
+
+(async () => {
+  await registerGlobalCommands();
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -80,126 +113,135 @@ const commands = [
   client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    const data = await loadData();
-
-    if (interaction.commandName === '카드등록') {
-      const raw = interaction.options.getString('번호');
-      const norm = normalizeCard(raw);
-      if (!/^\d{16}$/.test(norm)) {
-        return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
-      }
-      data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
-      if (!data.payments[norm]) data.payments[norm] = [];
-      await saveData(data);
-      return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}**` });
+    let data;
+    try {
+      data = await loadData();
+    } catch (err) {
+      return interaction.reply({ content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
     }
 
-    if (interaction.commandName === '결제') {
-      const rawCard = interaction.options.getString('카드번호');
-      const amountRaw = interaction.options.getString('금액');
-      const norm = normalizeCard(rawCard);
-      if (!data.cards[norm]) {
-        return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
-      }
-      const amountNum = parseInt(amountRaw.replace(/,/g, '').trim(), 10);
-      if (Number.isNaN(amountNum) || amountNum <= 0) {
-        return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
-      }
-      const now = new Date();
-      const entry = { amount: amountNum, timestamp: now.toISOString() };
-      // 최신순: 앞에 추가
-      data.payments[norm] = data.payments[norm] || [];
-      data.payments[norm].unshift(entry);
-      await saveData(data);
-
-      const embed = new EmbedBuilder()
-        .setTitle('결제 완료')
-        .addFields(
-          { name: '카드', value: formatCardDisplay(norm), inline: true },
-          { name: '금액', value: `${amountNum.toLocaleString()}원`, inline: true },
-          { name: '날짜 (KST)', value: kstDateString(now), inline: true }
-        )
-        .setColor(0x00AE86)
-        .setTimestamp(now);
-
-      return interaction.reply({ embeds: [embed] });
-    }
-
-    if (interaction.commandName === '결제내역') {
-      const rawCard = interaction.options.getString('카드번호');
-      const norm = normalizeCard(rawCard);
-      if (!data.cards[norm]) {
-        return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
-      }
-      const payments = data.payments[norm] || [];
-      if (payments.length === 0) {
-        return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
+    try {
+      if (interaction.commandName === '카드등록') {
+        const raw = interaction.options.getString('번호');
+        const norm = normalizeCard(raw);
+        if (!/^\d{16}$/.test(norm)) {
+          return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
+        }
+        data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
+        if (!data.payments[norm]) data.payments[norm] = [];
+        await saveData(data);
+        return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}**` });
       }
 
-      const pageSize = 10;
-      const totalPages = Math.max(1, Math.ceil(payments.length / pageSize));
-      const totalAmount = payments.reduce((s, p) => s + (p.amount || 0), 0);
+      if (interaction.commandName === '결제') {
+        const rawCard = interaction.options.getString('카드번호');
+        const amountRaw = interaction.options.getString('금액');
+        const norm = normalizeCard(rawCard);
+        if (!data.cards[norm]) {
+          return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
+        }
+        const amountNum = parseInt(amountRaw.replace(/,/g, '').trim(), 10);
+        if (Number.isNaN(amountNum) || amountNum <= 0) {
+          return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
+        }
+        const now = new Date();
+        const entry = { amount: amountNum, timestamp: now.toISOString() };
+        data.payments[norm] = data.payments[norm] || [];
+        data.payments[norm].unshift(entry);
+        await saveData(data);
 
-      function makeEmbedForPage(pageIndex) {
-        const start = pageIndex * pageSize;
-        const slice = payments.slice(start, start + pageSize);
         const embed = new EmbedBuilder()
-          .setTitle(`결제내역 — ${formatCardDisplay(norm)}`)
-          .setColor(0x0099ff);
+          .setTitle('결제 완료')
+          .addFields(
+            { name: '카드', value: formatCardDisplay(norm), inline: true },
+            { name: '금액', value: `${amountNum.toLocaleString()}원`, inline: true },
+            { name: '날짜 (KST)', value: kstDateString(now), inline: true }
+          )
+          .setColor(0x00AE86)
+          .setTimestamp(now);
 
-        const desc = slice.map(p => {
-          const date = new Date(p.timestamp);
-          return `• **${p.amount.toLocaleString()}원** — ${kstDateString(date)}`;
-        }).join('\n');
-
-        embed.setDescription(desc || '내역 없음');
-        embed.setFooter({ text: `총 사용액: ${totalAmount.toLocaleString()}원 | 페이지 ${pageIndex + 1}/${totalPages}` });
-        return embed;
+        return interaction.reply({ embeds: [embed] });
       }
 
-      // 버튼 (심플)
-      const prevBtn = new ButtonBuilder().setCustomId(`prev_${norm}`).setLabel('◀ 이전').setStyle(ButtonStyle.Primary);
-      const nextBtn = new ButtonBuilder().setCustomId(`next_${norm}`).setLabel('다음 ▶').setStyle(ButtonStyle.Primary);
-      const row = new ActionRowBuilder().addComponents(prevBtn, nextBtn);
-
-      // 초기 메시지
-      let current = 0;
-      const message = await interaction.reply({ embeds: [makeEmbedForPage(current)], components: [row], fetchReply: true });
-
-      // 컬렉터: 2분
-      const collector = message.createMessageComponentCollector({
-        componentType: ComponentType.Button,
-        time: 2 * 60 * 1000
-      });
-
-      collector.on('collect', async btnInt => {
-        // 카드 일치 확인
-        if (!btnInt.customId.includes(`_${norm}`)) {
-          return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
+      if (interaction.commandName === '결제내역') {
+        const rawCard = interaction.options.getString('카드번호');
+        const norm = normalizeCard(rawCard);
+        if (!data.cards[norm]) {
+          return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
         }
-        // 페이지 변경 (순환)
-        if (btnInt.customId.startsWith('prev_')) {
-          current = (current - 1 + totalPages) % totalPages;
-        } else {
-          current = (current + 1) % totalPages;
+        const payments = data.payments[norm] || [];
+        if (payments.length === 0) {
+          return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
         }
-        await btnInt.update({ embeds: [makeEmbedForPage(current)], components: [row] });
-      });
 
-      collector.on('end', async () => {
-        // 버튼 비활성화
-        try {
-          const disabledRow = new ActionRowBuilder().addComponents(
-            prevBtn.setDisabled(true),
-            nextBtn.setDisabled(true)
-          );
-          await message.edit({ components: [disabledRow] });
-        } catch (e) {
-          // 무시
+        const pageSize = 10;
+        const totalPages = Math.max(1, Math.ceil(payments.length / pageSize));
+        const totalAmount = payments.reduce((s, p) => s + (p.amount || 0), 0);
+
+        function makeEmbedForPage(pageIndex) {
+          const start = pageIndex * pageSize;
+          const slice = payments.slice(start, start + pageSize);
+          const embed = new EmbedBuilder()
+            .setTitle(`결제내역 — ${formatCardDisplay(norm)}`)
+            .setColor(0x0099ff);
+
+          const desc = slice.map(p => {
+            const date = new Date(p.timestamp);
+            return `• **${p.amount.toLocaleString()}원** — ${kstDateString(date)}`;
+          }).join('\n');
+
+          embed.setDescription(desc || '내역 없음');
+          embed.setFooter({ text: `총 사용액: ${totalAmount.toLocaleString()}원 | 페이지 ${pageIndex + 1}/${totalPages}` });
+          return embed;
         }
-      });
+
+        const prevBtn = new ButtonBuilder().setCustomId(`prev_${norm}`).setLabel('◀ 이전').setStyle(ButtonStyle.Primary);
+        const nextBtn = new ButtonBuilder().setCustomId(`next_${norm}`).setLabel('다음 ▶').setStyle(ButtonStyle.Primary);
+        const row = new ActionRowBuilder().addComponents(prevBtn, nextBtn);
+
+        let current = 0;
+        const message = await interaction.reply({ embeds: [makeEmbedForPage(current)], components: [row], fetchReply: true });
+
+        const collector = message.createMessageComponentCollector({
+          componentType: ComponentType.Button,
+          time: 2 * 60 * 1000
+        });
+
+        collector.on('collect', async btnInt => {
+          if (!btnInt.customId.includes(`_${norm}`)) {
+            return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
+          }
+          if (btnInt.customId.startsWith('prev_')) {
+            current = (current - 1 + totalPages) % totalPages;
+          } else {
+            current = (current + 1) % totalPages;
+          }
+          await btnInt.update({ embeds: [makeEmbedForPage(current)], components: [row] });
+        });
+
+        collector.on('end', async () => {
+          try {
+            const disabledRow = new ActionRowBuilder().addComponents(
+              prevBtn.setDisabled(true),
+              nextBtn.setDisabled(true)
+            );
+            await message.edit({ components: [disabledRow] });
+          } catch (e) {
+            // 무시
+          }
+        });
+      }
+    } catch (err) {
+      console.error('명령 처리 중 오류:', err);
+      try { await interaction.reply({ content: '명령 처리 중 오류가 발생했습니다.', ephemeral: true }); } catch (e) { /* 무시 */ }
     }
   });
 
-  client.login(TOKEN);
+  // 안전한 로그인 시도
+  try {
+    await client.login(TOKEN);
+  } catch (err) {
+    console.error('로그인 실패: 토큰이 유효하지 않거나 네트워크 오류가 발생했습니다.', err);
+    process.exit(1);
+  }
 })();
