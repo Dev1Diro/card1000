@@ -1,11 +1,12 @@
 /**
- * 안정화된 Discord Card Bot (글로벌 명령 선택 등록)
+ * 안정화된 Discord Card Bot (포트 바인딩 포함)
  * Node 18+, discord.js v14
  *
  * 필수 환경변수: TOKEN, CLIENT_ID
- * 선택 환경변수: REGISTER_COMMANDS=true, DATA_FILE=/path/to/storage.json
+ * 선택 환경변수: REGISTER_COMMANDS=true, DATA_FILE=/path/to/storage.json, PORT
  */
 
+const http = require('http');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
 const fs = require('fs-extra');
@@ -15,8 +16,9 @@ const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const REGISTER_COMMANDS = (process.env.REGISTER_COMMANDS || 'false').toLowerCase() === 'true';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'storage.json');
+const PORT = process.env.PORT || 3000;
 
-// 환경변수 기본 검사
+// 환경변수 검사
 if (!TOKEN || TOKEN.trim().length === 0) {
   console.error('FATAL: TOKEN 환경변수가 설정되어 있지 않습니다.');
   process.exit(1);
@@ -25,6 +27,14 @@ if (!CLIENT_ID || CLIENT_ID.trim().length === 0) {
   console.error('FATAL: CLIENT_ID 환경변수가 설정되어 있지 않습니다.');
   process.exit(1);
 }
+
+// 간단한 HTTP 서버: Render 같은 플랫폼에서 포트 검사 통과용
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+}).listen(PORT, () => {
+  console.log(`HTTP server listening on port ${PORT}`);
+});
 
 // 데이터 파일 초기화/로딩
 async function loadData() {
@@ -49,13 +59,8 @@ async function saveData(data) {
   }
 }
 
-function normalizeCard(card) {
-  return card.replace(/-/g, '').trim();
-}
-function formatCardDisplay(card) {
-  const n = normalizeCard(card);
-  return n.replace(/(\d{4})(?=\d)/g, '$1-');
-}
+function normalizeCard(card) { return card.replace(/-/g, '').trim(); }
+function formatCardDisplay(card) { const n = normalizeCard(card); return n.replace(/(\d{4})(?=\d)/g, '$1-'); }
 function kstDateString(date = new Date()) {
   const parts = new Intl.DateTimeFormat('ko-KR', {
     timeZone: 'Asia/Seoul',
@@ -87,7 +92,7 @@ const commands = [
 // 글로벌 명령 등록 (선택)
 async function registerGlobalCommands() {
   if (!REGISTER_COMMANDS) {
-    console.log('글로벌 명령 등록이 비활성화되어 있습니다. (REGISTER_COMMANDS != true)');
+    console.log('글로벌 명령 등록 비활성화 (REGISTER_COMMANDS != true)');
     return;
   }
   const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -97,7 +102,6 @@ async function registerGlobalCommands() {
     console.log('글로벌 명령 등록 요청 전송 완료.');
   } catch (err) {
     console.error('명령 등록 실패:', err);
-    // 명령 등록 실패는 치명적이지 않으므로 프로세스 종료하지 않음
   }
 }
 
@@ -106,6 +110,7 @@ async function registerGlobalCommands() {
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
+  // 주의: discord.js v14에서는 'ready' 이벤트 사용. v15에서 'clientReady'로 변경 예정이라는 경고가 뜰 수 있음.
   client.once('ready', () => {
     console.log(`Logged in as ${client.user.tag}`);
   });
@@ -114,9 +119,7 @@ async function registerGlobalCommands() {
     if (!interaction.isChatInputCommand()) return;
 
     let data;
-    try {
-      data = await loadData();
-    } catch (err) {
+    try { data = await loadData(); } catch (err) {
       return interaction.reply({ content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
     }
 
@@ -124,9 +127,7 @@ async function registerGlobalCommands() {
       if (interaction.commandName === '카드등록') {
         const raw = interaction.options.getString('번호');
         const norm = normalizeCard(raw);
-        if (!/^\d{16}$/.test(norm)) {
-          return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
-        }
+        if (!/^\d{16}$/.test(norm)) return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
         data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
         if (!data.payments[norm]) data.payments[norm] = [];
         await saveData(data);
@@ -137,13 +138,9 @@ async function registerGlobalCommands() {
         const rawCard = interaction.options.getString('카드번호');
         const amountRaw = interaction.options.getString('금액');
         const norm = normalizeCard(rawCard);
-        if (!data.cards[norm]) {
-          return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
-        }
+        if (!data.cards[norm]) return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
         const amountNum = parseInt(amountRaw.replace(/,/g, '').trim(), 10);
-        if (Number.isNaN(amountNum) || amountNum <= 0) {
-          return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
-        }
+        if (Number.isNaN(amountNum) || amountNum <= 0) return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         const now = new Date();
         const entry = { amount: amountNum, timestamp: now.toISOString() };
         data.payments[norm] = data.payments[norm] || [];
@@ -166,13 +163,9 @@ async function registerGlobalCommands() {
       if (interaction.commandName === '결제내역') {
         const rawCard = interaction.options.getString('카드번호');
         const norm = normalizeCard(rawCard);
-        if (!data.cards[norm]) {
-          return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
-        }
+        if (!data.cards[norm]) return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
         const payments = data.payments[norm] || [];
-        if (payments.length === 0) {
-          return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
-        }
+        if (payments.length === 0) return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
 
         const pageSize = 10;
         const totalPages = Math.max(1, Math.ceil(payments.length / pageSize));
@@ -208,14 +201,9 @@ async function registerGlobalCommands() {
         });
 
         collector.on('collect', async btnInt => {
-          if (!btnInt.customId.includes(`_${norm}`)) {
-            return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
-          }
-          if (btnInt.customId.startsWith('prev_')) {
-            current = (current - 1 + totalPages) % totalPages;
-          } else {
-            current = (current + 1) % totalPages;
-          }
+          if (!btnInt.customId.includes(`_${norm}`)) return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
+          if (btnInt.customId.startsWith('prev_')) current = (current - 1 + totalPages) % totalPages;
+          else current = (current + 1) % totalPages;
           await btnInt.update({ embeds: [makeEmbedForPage(current)], components: [row] });
         });
 
@@ -226,9 +214,7 @@ async function registerGlobalCommands() {
               nextBtn.setDisabled(true)
             );
             await message.edit({ components: [disabledRow] });
-          } catch (e) {
-            // 무시
-          }
+          } catch (e) { /* 무시 */ }
         });
       }
     } catch (err) {
@@ -237,7 +223,6 @@ async function registerGlobalCommands() {
     }
   });
 
-  // 안전한 로그인 시도
   try {
     await client.login(TOKEN);
   } catch (err) {
