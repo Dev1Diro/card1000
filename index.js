@@ -1,35 +1,19 @@
 /**
- * Discord Card Bot - 안정화 버전 (Render 친화적)
- *
- * 필수 환경변수:
- *   TOKEN         - Discord Bot Token
- *   CLIENT_ID     - Application (Client) ID
- *
- * 선택 환경변수:
- *   REGISTER_COMMANDS - "true"로 설정하면 글로벌 명령을 등록 (한 번만 실행 권장)
- *   DATA_FILE         - 저장 파일 경로 (절대경로 권장). 기본: ./storage.json
- *   PORT              - HTTP 포트 (Render Web Service용). 기본: 3000
- *
- * 변경 요약:
- * - 디렉터리 보장 및 절대경로 사용
- * - 빈 파일 처리 및 파싱 실패 시 안전 복구
- * - atomic write (tmp 파일) + 재시도 로직
- * - save queue 오버플로우 방지
+ * index.js
+ * - 메인 애플리케이션: Discord 명령 처리
+ * - storage.js를 사용하여 데이터 안전성 보장
  */
 
 const http = require('http');
 const path = require('path');
-const fs = require('fs-extra');
-const { dirname } = require('path');
-const {
-  Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType
-} = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
+
+const storage = require('./storage');
 
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const REGISTER_COMMANDS = (process.env.REGISTER_COMMANDS || 'false').toLowerCase() === 'true';
-const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'storage.json');
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 // 환경변수 검사
@@ -42,115 +26,13 @@ if (!CLIENT_ID || CLIENT_ID.trim().length === 0) {
   process.exit(1);
 }
 
-// 간단한 HTTP 서버 (Render Web Service에서 포트 검사 통과용)
+// HTTP 바인딩 (Render)
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
 }).listen(PORT, () => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
-
-// --- 안전한 데이터 저장 로직 ---
-const saveQueue = [];
-let saving = false;
-
-// atomic write: tmp 파일에 쓰고 이동
-async function atomicWriteJson(filePath, data) {
-  const resolved = path.resolve(filePath);
-  await fs.ensureDir(path.dirname(resolved));
-  const tmp = `${resolved}.tmp.${Date.now()}`;
-  await fs.writeJson(tmp, data, { spaces: 2, encoding: 'utf8' });
-  await fs.move(tmp, resolved, { overwrite: true });
-}
-
-// enqueueSave: 큐 길이 제한 및 안정적 처리
-async function enqueueSave(data) {
-  return new Promise((resolve, reject) => {
-    if (saveQueue.length > 1000) {
-      return reject(new Error('save queue overflow'));
-    }
-    saveQueue.push({ data, resolve, reject });
-    // processSaveQueue 내부에서 동시 실행을 막음
-    processSaveQueue().catch(err => {
-      console.error('processSaveQueue error:', err);
-    });
-  });
-}
-
-async function processSaveQueue() {
-  if (saving) return;
-  saving = true;
-  while (saveQueue.length > 0) {
-    const { data, resolve, reject } = saveQueue.shift();
-    try {
-      await atomicWriteJson(DATA_FILE, data);
-      resolve();
-    } catch (err) {
-      console.error('atomicWriteJson 실패:', err);
-      // 간단한 재시도(지연 후 1회)
-      try {
-        await new Promise(r => setTimeout(r, 200));
-        await atomicWriteJson(DATA_FILE, data);
-        resolve();
-      } catch (err2) {
-        console.error('재시도 실패:', err2);
-        reject(err2);
-      }
-    }
-  }
-  saving = false;
-}
-
-// loadData: 파일 없으면 생성, 빈 파일/파싱 실패 시 복구
-async function loadData() {
-  try {
-    const resolved = path.resolve(DATA_FILE);
-    await fs.ensureDir(path.dirname(resolved));
-
-    if (!await fs.pathExists(resolved)) {
-      const init = { cards: {}, payments: {} };
-      await atomicWriteJson(resolved, init);
-      console.log(`데이터 파일 생성: ${resolved}`);
-      return init;
-    }
-
-    const stats = await fs.stat(resolved);
-    if (stats.size === 0) {
-      console.warn('데이터 파일이 비어있습니다. 초기화합니다.');
-      const init = { cards: {}, payments: {} };
-      await atomicWriteJson(resolved, init);
-      return init;
-    }
-
-    const raw = await fs.readFile(resolved, 'utf8');
-    try {
-      const parsed = JSON.parse(raw);
-      parsed.cards = parsed.cards || {};
-      parsed.payments = parsed.payments || {};
-      return parsed;
-    } catch (parseErr) {
-      console.error('데이터 파일 파싱 실패:', parseErr);
-      const bak = `${resolved}.corrupt.${Date.now()}`;
-      await fs.copy(resolved, bak);
-      console.warn(`손상된 데이터 파일을 백업했습니다: ${bak}`);
-      const init = { cards: {}, payments: {} };
-      await atomicWriteJson(resolved, init);
-      console.log('데이터 파일을 초기화했습니다.');
-      return init;
-    }
-  } catch (err) {
-    console.error('데이터 파일 로드 중 예외:', err);
-    try {
-      const init = { cards: {}, payments: {} };
-      await atomicWriteJson(path.resolve(DATA_FILE), init);
-      console.log('데이터 파일을 강제 초기화했습니다.');
-      return init;
-    } catch (err2) {
-      console.error('강제 초기화 실패:', err2);
-      throw err2;
-    }
-  }
-}
 
 // 유틸
 function normalizeCard(card) { return String(card).replace(/-/g, '').trim(); }
@@ -186,7 +68,6 @@ const commands = [
     .addStringOption(opt => opt.setName('카드번호').setDescription('등록된 카드번호').setRequired(true))
 ].map(c => c.toJSON());
 
-// 글로벌 명령 등록 (선택)
 async function registerGlobalCommands() {
   if (!REGISTER_COMMANDS) {
     console.log('글로벌 명령 등록 비활성화 (REGISTER_COMMANDS != true)');
@@ -203,6 +84,15 @@ async function registerGlobalCommands() {
 }
 
 (async () => {
+  // storage 초기화
+  try {
+    await storage.init();
+    console.log('storage initialized at', storage.DATA_FILE);
+  } catch (e) {
+    console.error('storage init failed:', e);
+    process.exit(1);
+  }
+
   await registerGlobalCommands();
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -214,14 +104,6 @@ async function registerGlobalCommands() {
   client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
-    let data;
-    try {
-      data = await loadData();
-    } catch (err) {
-      console.error('loadData 실패:', err);
-      return interaction.reply({ content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
-    }
-
     try {
       if (interaction.commandName === '카드등록') {
         const raw = interaction.options.getString('번호');
@@ -229,14 +111,18 @@ async function registerGlobalCommands() {
         if (!/^\d{16}$/.test(norm)) {
           return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
         }
-        data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
-        if (!data.payments[norm]) data.payments[norm] = [];
+
+        // 안전한 변경: setData를 통해 동기적 변경 + 저장 보장
         try {
-          await enqueueSave(data);
+          await storage.setData(data => {
+            data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
+            if (!data.payments[norm]) data.payments[norm] = [];
+          });
         } catch (saveErr) {
           console.error('데이터 저장 실패:', saveErr);
           return interaction.reply({ content: '서버 내부 오류: 카드 등록 중 저장에 실패했습니다.', ephemeral: true });
         }
+
         return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}**` });
       }
 
@@ -244,6 +130,7 @@ async function registerGlobalCommands() {
         const rawCard = interaction.options.getString('카드번호');
         const amountRaw = interaction.options.getString('금액');
         const norm = normalizeCard(rawCard);
+        const data = storage.get();
         if (!data.cards[norm]) {
           return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
         }
@@ -252,13 +139,13 @@ async function registerGlobalCommands() {
           return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         }
         const now = new Date();
-        const entry = { amount: amountNum, timestamp: now.toISOString() };
-        data.payments[norm] = data.payments[norm] || [];
-        data.payments[norm].unshift(entry); // 최신순
         try {
-          await enqueueSave(data);
+          await storage.setData(d => {
+            d.payments[norm] = d.payments[norm] || [];
+            d.payments[norm].unshift({ amount: amountNum, timestamp: now.toISOString() });
+          });
         } catch (saveErr) {
-          console.error('데이터 저장 실패:', saveErr);
+          console.error('결제 저장 실패:', saveErr);
           return interaction.reply({ content: '서버 내부 오류: 결제 기록 저장 실패', ephemeral: true });
         }
 
@@ -278,6 +165,7 @@ async function registerGlobalCommands() {
       if (interaction.commandName === '결제내역') {
         const rawCard = interaction.options.getString('카드번호');
         const norm = normalizeCard(rawCard);
+        const data = storage.get();
         if (!data.cards[norm]) {
           return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
         }
@@ -338,35 +226,34 @@ async function registerGlobalCommands() {
               nextBtn.setDisabled(true)
             );
             await message.edit({ components: [disabledRow] });
-          } catch (e) { /* 무시 */ }
+          } catch (e) { /* ignore */ }
         });
       }
     } catch (err) {
       console.error('명령 처리 중 오류:', err);
-      try { await interaction.reply({ content: '명령 처리 중 오류가 발생했습니다.', ephemeral: true }); } catch (e) { /* 무시 */ }
+      try { await interaction.reply({ content: '명령 처리 중 오류가 발생했습니다.', ephemeral: true }); } catch (e) { /* ignore */ }
     }
   });
 
-  // 안전한 로그인
+  // 로그인
   try {
     await client.login(TOKEN);
   } catch (err) {
-    console.error('로그인 실패: 토큰이 유효하지 않거나 네트워크 오류가 발생했습니다.', err);
+    console.error('로그인 실패:', err);
     process.exit(1);
   }
 
-  // 프로세스 종료 시 안전 처리
+  // 프로세스 종료 시 storage flush 보장
   process.on('SIGINT', async () => {
     console.log('SIGINT 수신, 종료 중...');
-    try { await client.destroy(); } catch (e) { /* 무시 */ }
+    try { await storage.flushAll(); } catch (e) { /* ignore */ }
+    try { await client.destroy(); } catch (e) { /* ignore */ }
     process.exit(0);
   });
   process.on('SIGTERM', async () => {
     console.log('SIGTERM 수신, 종료 중...');
-    try { await client.destroy(); } catch (e) { /* 무시 */ }
+    try { await storage.flushAll(); } catch (e) { /* ignore */ }
+    try { await client.destroy(); } catch (e) { /* ignore */ }
     process.exit(0);
-  });
-  process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled Rejection:', reason);
   });
 })();
