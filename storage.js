@@ -22,6 +22,29 @@ let saveQueue = [];
 let saving = false;
 let initialized = false;
 
+function createEmptyData() {
+  return { cards: {}, money: {}, payments: {} };
+}
+
+function normalizeDataShape(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { normalized: createEmptyData(), changed: true };
+  }
+
+  const normalized = {
+    cards: data.cards && typeof data.cards === 'object' && !Array.isArray(data.cards) ? data.cards : {},
+    money: data.money && typeof data.money === 'object' && !Array.isArray(data.money) ? data.money : {},
+    payments: data.payments && typeof data.payments === 'object' && !Array.isArray(data.payments) ? data.payments : {}
+  };
+
+  const changed =
+    normalized.cards !== data.cards ||
+    normalized.money !== data.money ||
+    normalized.payments !== data.payments;
+
+  return { normalized, changed };
+}
+
 function formatNow() {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
@@ -42,7 +65,7 @@ async function rotateBackups() {
 async function atomicWriteJson(filePath, data) {
   const resolved = path.resolve(filePath);
   await fs.ensureDir(path.dirname(resolved));
-  const tmp = `${resolved}.tmp.${Date.now()}.${Math.random().toString(36).slice(2,8)}`;
+  const tmp = `${resolved}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
   await fs.writeJson(tmp, data, { spaces: 2, encoding: 'utf8' });
   await fs.move(tmp, resolved, { overwrite: true });
 }
@@ -55,7 +78,7 @@ async function safeWriteWithRetry(filePath, data) {
       return;
     } catch (err) {
       lastErr = err;
-      console.error(`atomic write attempt ${i+1} failed:`, err);
+      console.error(`atomic write attempt ${i + 1} failed:`, err);
       await new Promise(r => setTimeout(r, SAVE_RETRY_DELAY_MS));
     }
   }
@@ -79,7 +102,7 @@ async function init() {
   try {
     await fs.ensureDir(path.dirname(DATA_FILE));
     await fs.ensureFile(DATA_FILE);
-    try { fs.chmodSync(DATA_FILE, 0o600); } catch(e) { /* ignore */ }
+    try { fs.chmodSync(DATA_FILE, 0o600); } catch (e) { /* ignore */ }
   } catch (e) {
     console.error('ensure file/dir failed:', e);
   }
@@ -87,7 +110,7 @@ async function init() {
   try {
     const stats = await fs.stat(DATA_FILE);
     if (stats.size === 0) {
-      inMemory = { cards: {}, payments: {} };
+      inMemory = createEmptyData();
       await safeWriteWithRetry(DATA_FILE, inMemory);
       dirty = false;
       console.log('Initialized empty storage file.');
@@ -95,22 +118,27 @@ async function init() {
       const raw = await fs.readFile(DATA_FILE, 'utf8');
       try {
         const parsed = JSON.parse(raw);
-        parsed.cards = parsed.cards || {};
-        parsed.payments = parsed.payments || {};
-        inMemory = parsed;
+        const { normalized, changed } = normalizeDataShape(parsed);
+        inMemory = normalized;
         dirty = false;
+
+        if (changed) {
+          await safeWriteWithRetry(DATA_FILE, inMemory);
+          console.log('Storage schema normalized and persisted.');
+        }
+
         console.log('Loaded storage from', DATA_FILE);
       } catch (parseErr) {
         console.error('parse error, backing up and reinitializing:', parseErr);
         await backupCorruptFile(DATA_FILE);
-        inMemory = { cards: {}, payments: {} };
+        inMemory = createEmptyData();
         await safeWriteWithRetry(DATA_FILE, inMemory);
         dirty = false;
       }
     }
   } catch (err) {
     console.error('init read error, attempting to create new storage:', err);
-    inMemory = { cards: {}, payments: {} };
+    inMemory = createEmptyData();
     try {
       await safeWriteWithRetry(DATA_FILE, inMemory);
       dirty = false;
@@ -136,6 +164,7 @@ async function init() {
       console.error('storage: flush failed during shutdown:', e);
     }
   };
+
   process.on('SIGINT', graceful);
   process.on('SIGTERM', graceful);
   process.on('beforeExit', graceful);
@@ -197,6 +226,8 @@ async function flushAll() {
 async function setData(mutator) {
   if (!initialized) throw new Error('storage not initialized');
   try {
+    const normalized = normalizeDataShape(inMemory).normalized;
+    inMemory = normalized;
     mutator(inMemory);
     markDirty();
     await enqueueSave(inMemory);
@@ -213,4 +244,4 @@ module.exports = {
   enqueueSave,
   flushAll,
   DATA_FILE
-};
+};s

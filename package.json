@@ -1,7 +1,7 @@
 {
   "name": "discord-card-bot",
-  "version": "1.0.4",
-  "description": "Game card payment bot (virtual) - Render ready, stable",
+  "version": "1.0.5",
+  "description": "Game card payment bot (virtual) - Render ready, resilient storage",
   "main": "index.js",
   "engines": {
     "node": ">=18"

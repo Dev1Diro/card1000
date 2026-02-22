@@ -4,9 +4,18 @@
  */
 
 const http = require('http');
-const path = require('path');
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ComponentType
+} = require('discord.js');
 
 const storage = require('./storage');
 
@@ -31,15 +40,27 @@ http.createServer((req, res) => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
 
-function normalizeCard(card) { return String(card).replace(/-/g, '').trim(); }
+function normalizeCard(card) {
+  return String(card || '').replace(/-/g, '').trim();
+}
+
 function formatCardDisplay(card) {
   const n = normalizeCard(card);
   return n.replace(/(\d{4})(?=\d)/g, '$1-');
 }
+
+function parseAmount(raw) {
+  const n = parseInt(String(raw || '').replace(/,/g, '').trim(), 10);
+  if (Number.isNaN(n) || n <= 0) return null;
+  return n;
+}
+
 function kstDateString(date = new Date()) {
   const parts = new Intl.DateTimeFormat('ko-KR', {
     timeZone: 'Asia/Seoul',
-    year: 'numeric', month: '2-digit', day: '2-digit'
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
   }).formatToParts(date);
   const y = parts.find(p => p.type === 'year').value;
   const m = parts.find(p => p.type === 'month').value;
@@ -73,6 +94,7 @@ async function registerGlobalCommands() {
     console.log('글로벌 명령 등록 비활성화 (REGISTER_COMMANDS != true)');
     return;
   }
+
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   try {
     console.log('글로벌 명령 등록 시작...');
@@ -104,44 +126,49 @@ async function registerGlobalCommands() {
     if (!interaction.isChatInputCommand()) return;
 
     try {
-      // 카드등록: money 초기화(0)
       if (interaction.commandName === '카드등록') {
         const raw = interaction.options.getString('번호');
         const norm = normalizeCard(raw);
+
         if (!/^\d{16}$/.test(norm)) {
           return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
         }
 
         try {
           await storage.setData(data => {
+            data.cards = data.cards || {};
+            data.money = data.money || {};
+            data.payments = data.payments || {};
+
             data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
             data.money[norm] = data.money[norm] || 0;
-            if (!data.payments[norm]) data.payments[norm] = [];
+            data.payments[norm] = data.payments[norm] || [];
           });
         } catch (saveErr) {
           console.error('데이터 저장 실패:', saveErr);
           return interaction.reply({ content: '서버 내부 오류: 카드 등록 중 저장에 실패했습니다.', ephemeral: true });
         }
 
-        return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}** (잔액: ${storage.get().money[norm].toLocaleString()}원)` });
+        const balance = storage.get().money?.[norm] || 0;
+        return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}** (잔액: ${balance.toLocaleString()}원)` });
       }
 
-      // 카드충전: money 증가
       if (interaction.commandName === '카드충전') {
-        const rawCard = interaction.options.getString('카드번호');
-        const amountRaw = interaction.options.getString('금액');
-        const norm = normalizeCard(rawCard);
+        const norm = normalizeCard(interaction.options.getString('카드번호'));
+        const amountNum = parseAmount(interaction.options.getString('금액'));
         const data = storage.get();
-        if (!data.cards[norm]) {
+
+        if (!data.cards?.[norm]) {
           return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
         }
-        const amountNum = parseInt(String(amountRaw).replace(/,/g, '').trim(), 10);
-        if (Number.isNaN(amountNum) || amountNum <= 0) {
+
+        if (!amountNum) {
           return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         }
 
         try {
           await storage.setData(d => {
+            d.money = d.money || {};
             d.money[norm] = (d.money[norm] || 0) + amountNum;
           });
         } catch (saveErr) {
@@ -149,25 +176,24 @@ async function registerGlobalCommands() {
           return interaction.reply({ content: '서버 내부 오류: 충전 중 저장에 실패했습니다.', ephemeral: true });
         }
 
-        const newBal = storage.get().money[norm];
+        const newBal = storage.get().money?.[norm] || 0;
         return interaction.reply({ content: `충전 완료: **${formatCardDisplay(norm)}**에 ${amountNum.toLocaleString()}원 충전되었습니다. 잔액: ${newBal.toLocaleString()}원` });
       }
 
-      // 결제: money 검사 후 차감, payments 기록
       if (interaction.commandName === '결제') {
-        const rawCard = interaction.options.getString('카드번호');
-        const amountRaw = interaction.options.getString('금액');
-        const norm = normalizeCard(rawCard);
+        const norm = normalizeCard(interaction.options.getString('카드번호'));
+        const amountNum = parseAmount(interaction.options.getString('금액'));
         const data = storage.get();
-        if (!data.cards[norm]) {
+
+        if (!data.cards?.[norm]) {
           return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
         }
-        const amountNum = parseInt(String(amountRaw).replace(/,/g, '').trim(), 10);
-        if (Number.isNaN(amountNum) || amountNum <= 0) {
+
+        if (!amountNum) {
           return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
         }
 
-        const currentBalance = data.money[norm] || 0;
+        const currentBalance = data.money?.[norm] || 0;
         if (currentBalance < amountNum) {
           return interaction.reply({ content: `잔액이 부족합니다. 현재 잔액: ${currentBalance.toLocaleString()}원`, ephemeral: true });
         }
@@ -175,6 +201,8 @@ async function registerGlobalCommands() {
         const now = new Date();
         try {
           await storage.setData(d => {
+            d.money = d.money || {};
+            d.payments = d.payments || {};
             d.money[norm] = (d.money[norm] || 0) - amountNum;
             d.payments[norm] = d.payments[norm] || [];
             d.payments[norm].unshift({ amount: amountNum, timestamp: now.toISOString() });
@@ -189,7 +217,7 @@ async function registerGlobalCommands() {
           .addFields(
             { name: '카드', value: formatCardDisplay(norm), inline: true },
             { name: '금액', value: `${amountNum.toLocaleString()}원`, inline: true },
-            { name: '잔액(결제 후)', value: `${storage.get().money[norm].toLocaleString()}원`, inline: true },
+            { name: '잔액(결제 후)', value: `${(storage.get().money?.[norm] || 0).toLocaleString()}원`, inline: true },
             { name: '날짜 (KST)', value: kstDateString(now), inline: true }
           )
           .setColor(0x00AE86)
@@ -198,15 +226,15 @@ async function registerGlobalCommands() {
         return interaction.reply({ embeds: [embed] });
       }
 
-      // 결제내역: payments 사용
       if (interaction.commandName === '결제내역') {
-        const rawCard = interaction.options.getString('카드번호');
-        const norm = normalizeCard(rawCard);
+        const norm = normalizeCard(interaction.options.getString('카드번호'));
         const data = storage.get();
-        if (!data.cards[norm]) {
+
+        if (!data.cards?.[norm]) {
           return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
         }
-        const payments = data.payments[norm] || [];
+
+        const payments = data.payments?.[norm] || [];
         if (payments.length === 0) {
           return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
         }
@@ -218,13 +246,14 @@ async function registerGlobalCommands() {
         function makeEmbedForPage(pageIndex) {
           const start = pageIndex * pageSize;
           const slice = payments.slice(start, start + pageSize);
+
           const embed = new EmbedBuilder()
             .setTitle(`결제내역 — ${formatCardDisplay(norm)}`)
             .setColor(0x0099ff);
 
           const desc = slice.map(p => {
             const date = new Date(p.timestamp);
-            return `• **${p.amount.toLocaleString()}원** — ${kstDateString(date)}`;
+            return `• **${(p.amount || 0).toLocaleString()}원** — ${kstDateString(date)}`;
           }).join('\n');
 
           embed.setDescription(desc || '내역 없음');
@@ -248,11 +277,13 @@ async function registerGlobalCommands() {
           if (!btnInt.customId.includes(`_${norm}`)) {
             return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
           }
+
           if (btnInt.customId.startsWith('prev_')) {
             current = (current - 1 + totalPages) % totalPages;
           } else {
             current = (current + 1) % totalPages;
           }
+
           await btnInt.update({ embeds: [makeEmbedForPage(current)], components: [row] });
         });
 
@@ -263,12 +294,18 @@ async function registerGlobalCommands() {
               nextBtn.setDisabled(true)
             );
             await message.edit({ components: [disabledRow] });
-          } catch (e) { /* ignore */ }
+          } catch (e) {
+            /* ignore */
+          }
         });
       }
     } catch (err) {
       console.error('명령 처리 중 오류:', err);
-      try { await interaction.reply({ content: '명령 처리 중 오류가 발생했습니다.', ephemeral: true }); } catch (e) { /* ignore */ }
+      try {
+        await interaction.reply({ content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
+      } catch (e) {
+        /* ignore */
+      }
     }
   });
 
@@ -285,6 +322,7 @@ async function registerGlobalCommands() {
     try { await client.destroy(); } catch (e) { /* ignore */ }
     process.exit(0);
   });
+
   process.on('SIGTERM', async () => {
     console.log('SIGTERM 수신, 종료 중...');
     try { await storage.flushAll(); } catch (e) { /* ignore */ }
