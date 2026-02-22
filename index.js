@@ -1,22 +1,35 @@
 /**
- * 안정화된 Discord Card Bot (포트 바인딩 포함)
- * Node 18+, discord.js v14
+ * Discord Card Bot - 안정화 버전 (Render 친화적)
  *
- * 필수 환경변수: TOKEN, CLIENT_ID
- * 선택 환경변수: REGISTER_COMMANDS=true, DATA_FILE=/path/to/storage.json, PORT
+ * 필수 환경변수:
+ *   TOKEN         - Discord Bot Token
+ *   CLIENT_ID     - Application (Client) ID
+ *
+ * 선택 환경변수:
+ *   REGISTER_COMMANDS - "true"로 설정하면 글로벌 명령을 등록 (한 번만 실행 권장)
+ *   DATA_FILE         - 저장 파일 경로 (절대경로 권장). 기본: ./storage.json
+ *   PORT              - HTTP 포트 (Render Web Service용). 기본: 3000
+ *
+ * 특징:
+ * - 포트 바인딩(간단한 HTTP 200)으로 Render Web Service 요구사항 충족
+ * - atomic write + in-memory save queue로 파일 손상/동시성 최소화
+ * - 손상된 JSON 자동 백업 및 재생성
+ * - 명확한 로그와 안전한 종료 처리
  */
 
 const http = require('http');
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } = require('discord.js');
-const fs = require('fs-extra');
 const path = require('path');
+const fs = require('fs-extra');
+const {
+  Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
+  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType
+} = require('discord.js');
 
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const REGISTER_COMMANDS = (process.env.REGISTER_COMMANDS || 'false').toLowerCase() === 'true';
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'storage.json');
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
 
 // 환경변수 검사
 if (!TOKEN || TOKEN.trim().length === 0) {
@@ -28,7 +41,7 @@ if (!CLIENT_ID || CLIENT_ID.trim().length === 0) {
   process.exit(1);
 }
 
-// 간단한 HTTP 서버: Render 같은 플랫폼에서 포트 검사 통과용
+// 간단한 HTTP 서버 (Render Web Service에서 포트 검사 통과용)
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
@@ -36,31 +49,79 @@ http.createServer((req, res) => {
   console.log(`HTTP server listening on port ${PORT}`);
 });
 
-// 데이터 파일 초기화/로딩
+// --- 안전한 데이터 저장 로직 ---
+// in-memory queue로 save 요청 직렬화 (동시성 완화)
+const saveQueue = [];
+let saving = false;
+
+async function atomicWriteJson(filePath, data) {
+  const tmp = `${filePath}.tmp.${Date.now()}`;
+  await fs.writeJson(tmp, data, { spaces: 2 });
+  await fs.move(tmp, filePath, { overwrite: true });
+}
+
+async function enqueueSave(data) {
+  return new Promise((resolve, reject) => {
+    saveQueue.push({ data, resolve, reject });
+    processSaveQueue().catch(err => console.error('save queue error:', err));
+  });
+}
+
+async function processSaveQueue() {
+  if (saving) return;
+  saving = true;
+  while (saveQueue.length > 0) {
+    const { data, resolve, reject } = saveQueue.shift();
+    try {
+      await atomicWriteJson(DATA_FILE, data);
+      resolve();
+    } catch (err) {
+      reject(err);
+    }
+  }
+  saving = false;
+}
+
+// loadData: 파일 없으면 생성, 손상 시 백업 후 재생성
 async function loadData() {
   try {
     if (!await fs.pathExists(DATA_FILE)) {
       await fs.ensureFile(DATA_FILE);
-      await fs.writeJson(DATA_FILE, { cards: {}, payments: {} }, { spaces: 2 });
+      const init = { cards: {}, payments: {} };
+      await atomicWriteJson(DATA_FILE, init);
       console.log(`데이터 파일 생성: ${DATA_FILE}`);
+      return init;
     }
-    return await fs.readJson(DATA_FILE);
+    const raw = await fs.readFile(DATA_FILE, 'utf8');
+    try {
+      const parsed = JSON.parse(raw);
+      // 기본 구조 보장
+      parsed.cards = parsed.cards || {};
+      parsed.payments = parsed.payments || {};
+      return parsed;
+    } catch (parseErr) {
+      console.error('데이터 파일 파싱 실패:', parseErr);
+      // 백업 후 재생성
+      const bak = `${DATA_FILE}.corrupt.${Date.now()}`;
+      await fs.copy(DATA_FILE, bak);
+      console.warn(`손상된 데이터 파일을 백업했습니다: ${bak}`);
+      const init = { cards: {}, payments: {} };
+      await atomicWriteJson(DATA_FILE, init);
+      console.log('데이터 파일을 초기화했습니다.');
+      return init;
+    }
   } catch (err) {
     console.error('데이터 파일 로드 실패:', err);
     throw err;
   }
 }
-async function saveData(data) {
-  try {
-    await fs.writeJson(DATA_FILE, data, { spaces: 2 });
-  } catch (err) {
-    console.error('데이터 저장 실패:', err);
-    throw err;
-  }
-}
 
-function normalizeCard(card) { return card.replace(/-/g, '').trim(); }
-function formatCardDisplay(card) { const n = normalizeCard(card); return n.replace(/(\d{4})(?=\d)/g, '$1-'); }
+// 유틸
+function normalizeCard(card) { return String(card).replace(/-/g, '').trim(); }
+function formatCardDisplay(card) {
+  const n = normalizeCard(card);
+  return n.replace(/(\d{4})(?=\d)/g, '$1-');
+}
 function kstDateString(date = new Date()) {
   const parts = new Intl.DateTimeFormat('ko-KR', {
     timeZone: 'Asia/Seoul',
@@ -102,6 +163,7 @@ async function registerGlobalCommands() {
     console.log('글로벌 명령 등록 요청 전송 완료.');
   } catch (err) {
     console.error('명령 등록 실패:', err);
+    // 치명적이지 않음: 계속 실행
   }
 }
 
@@ -110,7 +172,6 @@ async function registerGlobalCommands() {
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-  // 주의: discord.js v14에서는 'ready' 이벤트 사용. v15에서 'clientReady'로 변경 예정이라는 경고가 뜰 수 있음.
   client.once('ready', () => {
     console.log(`Logged in as ${client.user.tag}`);
   });
@@ -119,7 +180,10 @@ async function registerGlobalCommands() {
     if (!interaction.isChatInputCommand()) return;
 
     let data;
-    try { data = await loadData(); } catch (err) {
+    try {
+      data = await loadData();
+    } catch (err) {
+      console.error('loadData 실패:', err);
       return interaction.reply({ content: '서버 내부 오류: 데이터 로드 실패', ephemeral: true });
     }
 
@@ -127,10 +191,12 @@ async function registerGlobalCommands() {
       if (interaction.commandName === '카드등록') {
         const raw = interaction.options.getString('번호');
         const norm = normalizeCard(raw);
-        if (!/^\d{16}$/.test(norm)) return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
+        if (!/^\d{16}$/.test(norm)) {
+          return interaction.reply({ content: '카드번호 형식이 잘못되었습니다. 16자리 숫자만 입력해주세요.', ephemeral: true });
+        }
         data.cards[norm] = { owner: interaction.user.id, display: formatCardDisplay(norm) };
         if (!data.payments[norm]) data.payments[norm] = [];
-        await saveData(data);
+        await enqueueSave(data);
         return interaction.reply({ content: `카드가 등록되었습니다: **${formatCardDisplay(norm)}**` });
       }
 
@@ -138,14 +204,18 @@ async function registerGlobalCommands() {
         const rawCard = interaction.options.getString('카드번호');
         const amountRaw = interaction.options.getString('금액');
         const norm = normalizeCard(rawCard);
-        if (!data.cards[norm]) return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
-        const amountNum = parseInt(amountRaw.replace(/,/g, '').trim(), 10);
-        if (Number.isNaN(amountNum) || amountNum <= 0) return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
+        if (!data.cards[norm]) {
+          return interaction.reply({ content: '등록되지 않은 카드입니다. 먼저 /카드등록 해주세요.', ephemeral: true });
+        }
+        const amountNum = parseInt(String(amountRaw).replace(/,/g, '').trim(), 10);
+        if (Number.isNaN(amountNum) || amountNum <= 0) {
+          return interaction.reply({ content: '금액 형식이 잘못되었습니다.', ephemeral: true });
+        }
         const now = new Date();
         const entry = { amount: amountNum, timestamp: now.toISOString() };
         data.payments[norm] = data.payments[norm] || [];
-        data.payments[norm].unshift(entry);
-        await saveData(data);
+        data.payments[norm].unshift(entry); // 최신순
+        await enqueueSave(data);
 
         const embed = new EmbedBuilder()
           .setTitle('결제 완료')
@@ -163,9 +233,13 @@ async function registerGlobalCommands() {
       if (interaction.commandName === '결제내역') {
         const rawCard = interaction.options.getString('카드번호');
         const norm = normalizeCard(rawCard);
-        if (!data.cards[norm]) return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
+        if (!data.cards[norm]) {
+          return interaction.reply({ content: '등록되지 않은 카드입니다.', ephemeral: true });
+        }
         const payments = data.payments[norm] || [];
-        if (payments.length === 0) return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
+        if (payments.length === 0) {
+          return interaction.reply({ content: '결제 내역이 없습니다.', ephemeral: true });
+        }
 
         const pageSize = 10;
         const totalPages = Math.max(1, Math.ceil(payments.length / pageSize));
@@ -201,9 +275,14 @@ async function registerGlobalCommands() {
         });
 
         collector.on('collect', async btnInt => {
-          if (!btnInt.customId.includes(`_${norm}`)) return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
-          if (btnInt.customId.startsWith('prev_')) current = (current - 1 + totalPages) % totalPages;
-          else current = (current + 1) % totalPages;
+          if (!btnInt.customId.includes(`_${norm}`)) {
+            return btnInt.reply({ content: '이 버튼은 다른 카드의 내역용입니다.', ephemeral: true });
+          }
+          if (btnInt.customId.startsWith('prev_')) {
+            current = (current - 1 + totalPages) % totalPages;
+          } else {
+            current = (current + 1) % totalPages;
+          }
           await btnInt.update({ embeds: [makeEmbedForPage(current)], components: [row] });
         });
 
@@ -223,10 +302,26 @@ async function registerGlobalCommands() {
     }
   });
 
+  // 안전한 로그인
   try {
     await client.login(TOKEN);
   } catch (err) {
     console.error('로그인 실패: 토큰이 유효하지 않거나 네트워크 오류가 발생했습니다.', err);
     process.exit(1);
   }
+
+  // 프로세스 종료 시 안전 처리
+  process.on('SIGINT', async () => {
+    console.log('SIGINT 수신, 종료 중...');
+    try { await client.destroy(); } catch (e) { /* 무시 */ }
+    process.exit(0);
+  });
+  process.on('SIGTERM', async () => {
+    console.log('SIGTERM 수신, 종료 중...');
+    try { await client.destroy(); } catch (e) { /* 무시 */ }
+    process.exit(0);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled Rejection:', reason);
+  });
 })();
