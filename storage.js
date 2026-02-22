@@ -1,15 +1,12 @@
-/**
- * storage.js
- * - 책임: 데이터 로드/저장/백업/주기적 flush/종료 시 대기
- * - 환경변수: DATA_FILE (권장 절대경로). 기본: ./storage.json
- */
-
 const fs = require('fs-extra');
 const path = require('path');
 
 const DEFAULT_PATH = path.join(__dirname, 'storage.json');
-const DATA_FILE = process.env.DATA_FILE ? path.resolve(process.env.DATA_FILE) : DEFAULT_PATH;
-const BACKUP_DIR = `${DATA_FILE}.backups`;
+let DATA_FILE = process.env.DATA_FILE ? path.resolve(process.env.DATA_FILE) : DEFAULT_PATH;
+
+function getBackupDir() {
+  return `${DATA_FILE}.backups`;
+}
 const MAX_BACKUPS = 10;
 const FLUSH_INTERVAL_MS = 60 * 1000;
 const SAVE_RETRY_DELAY_MS = 200;
@@ -38,18 +35,47 @@ function ensureDataShape(data) {
   return base;
 }
 
+
+async function findWritableDataFile(preferredFile) {
+  const candidates = [
+    preferredFile,
+    path.join(process.cwd(), path.basename(preferredFile || 'storage.json')),
+    path.join('/tmp', 'discord-card-bot-storage.json')
+  ].filter(Boolean);
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+
+    try {
+      await fs.ensureDir(path.dirname(resolved));
+      const probe = `${resolved}.probe.${Date.now()}`;
+      await fs.writeFile(probe, 'probe', 'utf8');
+      await fs.remove(probe);
+      return resolved;
+    } catch (e) {
+      console.warn(`DATA_FILE candidate not writable: ${resolved}`, e.code || e.message);
+    }
+  }
+
+  throw new Error('No writable DATA_FILE path found. Set DATA_FILE to a writable path.');
+}
+
 function formatNow() {
   return new Date().toISOString().replace(/[:.]/g, '-');
 }
 
 async function rotateBackups() {
   try {
-    await fs.ensureDir(BACKUP_DIR);
-    const files = await fs.readdir(BACKUP_DIR);
+    const backupDir = getBackupDir();
+    await fs.ensureDir(backupDir);
+    const files = await fs.readdir(backupDir);
     if (files.length <= MAX_BACKUPS) return;
     const sorted = files.sort();
     const remove = sorted.slice(0, files.length - MAX_BACKUPS);
-    await Promise.all(remove.map(f => fs.remove(path.join(BACKUP_DIR, f))));
+    await Promise.all(remove.map(f => fs.remove(path.join(backupDir, f))));
   } catch (e) {
     console.error('backup rotation failed:', e);
   }
@@ -80,11 +106,12 @@ async function safeWriteWithRetry(filePath, data) {
 
 async function backupCorruptFile(filePath) {
   try {
-    await fs.ensureDir(BACKUP_DIR);
+    const backupDir = getBackupDir();
+    await fs.ensureDir(backupDir);
     const bakName = `corrupt-${formatNow()}.json`;
-    await fs.copy(filePath, path.join(BACKUP_DIR, bakName));
+    await fs.copy(filePath, path.join(backupDir, bakName));
     await rotateBackups();
-    console.warn(`Backed up corrupt file to ${path.join(BACKUP_DIR, bakName)}`);
+    console.warn(`Backed up corrupt file to ${path.join(backupDir, bakName)}`);
   } catch (e) {
     console.error('failed to backup corrupt file:', e);
   }
@@ -94,6 +121,7 @@ async function init() {
   if (initialized) return;
 
   try {
+    DATA_FILE = await findWritableDataFile(DATA_FILE);
     await fs.ensureDir(path.dirname(DATA_FILE));
     await fs.ensureFile(DATA_FILE);
     try { fs.chmodSync(DATA_FILE, 0o600); } catch (e) { /* ignore */ }
@@ -228,5 +256,7 @@ module.exports = {
   setData,
   enqueueSave,
   flushAll,
-  DATA_FILE
+  get DATA_FILE() {
+    return DATA_FILE;
+  }
 };

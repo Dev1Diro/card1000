@@ -1,8 +1,3 @@
-/**
- * index.js
- * - Discord Card Bot (cards / money / payments 통합형)
- */
-
 const http = require('http');
 const {
   Client,
